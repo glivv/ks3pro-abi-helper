@@ -1,61 +1,35 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 import os
 import json
 import sqlite3
 import shutil
-from functools import reduce
 from Crypto.Hash import keccak
+from tqdm import tqdm
 
 CHAIN_ID_MAP = {
-    "ethereum": 1,
     "arbitrum": 42161,
     "avalanche": 43114,
+    "base": 8453,
+    "berachain": 80094,
     "bsc": 56,
     "celo": 42220,
+    "ethereum": 1,
     "fantom": 250,
     "flare": 14,
+    "fraxtal": 252,
     "harmony": 1666600000,
     "moonriver": 1285,
-    "optimism": 69,
+    "optimism": 10,
     "polygon": 137,
     "songbird": 19,
+    "sonic": 146,
 }
 
-def printProgressBar(
-    iteration,
-    total,
-    prefix="Progress:",
-    suffix="Complete",
-    decimals=1,
-    length=100,
-    fill="█",
-    printEnd="\r",
-):
-    """
-    Call in a loop to create terminal progress bar
-    @params:
-        iteration   - Required  : current iteration (Int)
-        total       - Required  : total iterations (Int)
-        prefix      - Optional  : prefix string (Str)
-        suffix      - Optional  : suffix string (Str)
-        decimals    - Optional  : positive number of decimals in percent complete (Int)
-        length      - Optional  : character length of bar (Int)
-        fill        - Optional  : bar fill character (Str)
-        printEnd    - Optional  : end character (e.g. "\r", "\r\n") (Str)
-    """
-    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
-    filledLength = int(length * iteration // total)
-    bar = fill * filledLength + "-" * (length - filledLength)
-    print("\r%s |%s| %s%% %s" % (prefix, bar, percent, suffix), end=printEnd)
-    # Print New Line on Complete
-    if iteration == total:
-        print()
-
-connection_pool = {};
+connection_pool = dict()
 
 def create_db_table(path):
     conn = sqlite3.connect(path)
+    conn.execute('PRAGMA temp_store = MEMORY')
+    conn.execute('PRAGMA synchronous = OFF')
     cursor = conn.cursor()
     try:
         create_table = """create table contracts
@@ -80,24 +54,22 @@ def create_db_table(path):
     conn.commit()
     conn.close()
 
-
 def get_or_create_db_table(path):
     if not os.path.exists(path):
         create_db_table(path)
         conn = sqlite3.connect(path)
-        connection_pool[f"{path}"] = conn
+        conn.execute('PRAGMA temp_store = MEMORY')
+        conn.execute('PRAGMA synchronous = OFF')
+        connection_pool[path] = conn
         return conn
     else:
-        return connection_pool[f"{path}"]
+        return connection_pool[path]
 
 def caclulate_selector_id(function_name_with_type):
     bytes_for_function = bytes(function_name_with_type, 'utf-8')
     sha = keccak.new(digest_bits=256)
     sha.update(bytes_for_function)
     return sha.hexdigest()[0:8]
-
-def insert_record_into_db(db_path):
-    pass
 
 def process_function_abi_object(func_obj):
     if(len(func_obj["inputs"])>0):
@@ -114,10 +86,7 @@ def parse_contract_json(json_contract):
     for each in abi_func_list:
         function_signature = f"{each['name']}({process_function_abi_object(each)})"
         selector = caclulate_selector_id(function_signature)
-        functions.append({
-            'abi': each,
-            'selector': selector
-        })
+        functions.append({ 'abi': each, 'selector': selector })
 
     return functions
 
@@ -131,59 +100,44 @@ def get_contract_info(contract_path):
             contract_version = 1
             contract_checkPoints = json.dumps(content.get("checkPoints",[]))
             abi_details = parse_contract_json(content)
-        except:
-            raise
+        except Exception as e:
+            print(f"exception {e} while getting contract info from {contract_path}")
+            raise e
 
     return content_address, contract_name, contract_metadate, contract_version, contract_checkPoints, abi_details
-
 
 def merge_abis_to_sqlite(chain_name, db_target_path, contracts_path):
     
     if not os.path.exists(contracts_path):
         return None
 
-    
-    fileslist = os.listdir(contracts_path)
+    for file in tqdm(os.listdir(contracts_path), desc=chain_name, ncols=100, mininterval=1, unit="contract"):
+        if file.endswith(".json"):
+            path = os.path.join(db_target_path, f"{CHAIN_ID_MAP[chain_name]}_{file[2].lower()}_contracts.db")
+            conn = get_or_create_db_table(path)
+            cursor = conn.cursor()
 
-    if len(fileslist):
-        sum_of_file = len(fileslist) - 1
-        location = 0
-        for file in fileslist:
-            if file.endswith(".json"):
-                db_sharding_index = file[2]
-                path = f"{db_target_path}/{CHAIN_ID_MAP[chain_name]}_{db_sharding_index.lower()}_contracts.db"
-                conn = get_or_create_db_table(path)
-                cursor = conn.cursor()
+            address, name, metabase, version, check_points, abi_details = get_contract_info(contract_path=os.path.join(contracts_path, file))
 
-                try:
-                    address, name, metabase, version, check_points, abi_details = get_contract_info(contract_path=contracts_path+file)
-                except Exception as e:
-                    print(e)
-                    print("{file} is error......".format(file=file))
-                    raise e
-                
-                for each in abi_details:
-                    selectorId = each['selector']
-                    functionABI = each['abi']
-                    sql_insert_info = "insert into contracts (address,name,selectorId,functionABI,version, checkPoints) values (?,?,?,?,?,?)"
-                    cursor.execute(sql_insert_info, (address, name, selectorId, json.dumps(functionABI),version, check_points))
-                location += 1
-                printProgressBar(location, sum_of_file, prefix=f"processing: {contracts_path}")
-            
-                cursor.close()
-                conn.commit()
+            batch = []
+            for fun in abi_details:
+                batch.append((address, name, fun['selector'], json.dumps(fun['abi']), version, check_points))
 
+            sql_insert_info = "insert into contracts (address,name,selectorId,functionABI,version,checkPoints) values (?,?,?,?,?,?)"
+            cursor.executemany(sql_insert_info, batch)
+
+            cursor.close()
+            conn.commit()
 
 if __name__ == "__main__":
-    ignored = [".github", ".git", "outputs", "v3"]
-    targets = [ name for name in os.listdir('.') if os.path.isdir(os.path.join('.', name)) and name not in ignored]
-    if os.path.exists("./outputs"):
-        shutil.rmtree("./outputs", ignore_errors=True)
-    if not os.path.exists("./outputs/contracts"):
-        os.makedirs("./outputs/contracts")
-    db_target_path = "./outputs/contracts"
-    for each_target in targets:
-        path = f"./{each_target}/"
-        merge_abis_to_sqlite(each_target, db_target_path, contracts_path=path)
-        [each.close() for each in connection_pool.values()]
-    shutil.make_archive('contracts_g3', 'zip', root_dir='./outputs', base_dir='contracts')
+    targets = [ name for name in os.listdir('ks-abi') ]
+    db_target_path = "contracts"
+
+    if os.path.exists(db_target_path):
+        shutil.rmtree(db_target_path, ignore_errors=True)
+    if not os.path.exists(db_target_path):
+        os.makedirs(db_target_path)
+
+    for target in targets:
+        merge_abis_to_sqlite(target, db_target_path, contracts_path=f"ks-abi/{target}/")
+        [conn.close() for conn in connection_pool.values()]
